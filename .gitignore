@@ -1,0 +1,52 @@
+# =========================
+# Python
+# =========================
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# =========================
+# Secrets / environment
+# =========================
+.env
+.env.*
+!.env.example
+
+# =========================
+# Local databases and caches
+# =========================
+*.db
+*.sqlite
+*.sqlite3
+*.log
+
+# ChromaDB local storage and backups
+**/chroma_db/
+**/chroma_db_backup_*/
+**/chroma_db_recovered_*/
+tmp_chroma_test/
+tmp_chroma_test2/
+
+# =========================
+# Project data (can be confidential)
+# =========================
+assistant_api/data/*
+assistant_giga/data/*
+!assistant_api/data/.gitkeep
+!assistant_giga/data/.gitkeep
+
+# =========================
+# IDE / OS
+# =========================
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

@@ -1,4 +1,4 @@
-# RAG Assistant Final Project
+# RAG Assistant
 
 Учебный проект с двумя отдельными RAG-приложениями:
 

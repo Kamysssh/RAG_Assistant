@@ -1,167 +1,235 @@
 """
-Консольное приложение для взаимодействия с RAG ассистентом (API mode).
+CLI: выбор роли (HR / постпродажа / продажи), диалог с RAG-ассистентом на OpenAI.
 """
 
-import sys
-import os
-from pathlib import Path
-from dotenv import load_dotenv
-from rag_pipeline import RAGPipeline
+from __future__ import annotations
 
-# Загрузка переменных окружения из .env файла
-# Ищем .env в корне проекта (на уровень выше)
-env_path = Path(__file__).parent.parent / '.env'
+import logging
+import os
+import sys
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+from config import ASSISTANT_ROLES, EMBEDDINGS_BACKEND, ROLE_LABELS
+from prompts import get_prompt
+from rag_pipeline import RAGPipeline
+from reindex_runner import reindex_all_roles
+
+# .env в корне репозитория
+env_path = Path(__file__).parent.parent / ".env"
 if env_path.exists():
     load_dotenv(env_path)
 else:
-    # Пытаемся загрузить из текущей директории
     load_dotenv()
 
 
+def setup_logging() -> None:
+    log_dir = Path(__file__).resolve().parent / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = log_dir / "app.log"
+    fmt = "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    root.handlers.clear()
+    fh = logging.FileHandler(log_file, encoding="utf-8")
+    fh.setLevel(logging.INFO)
+    fh.setFormatter(logging.Formatter(fmt))
+    sh = logging.StreamHandler(sys.stdout)
+    sh.setLevel(logging.INFO)
+    sh.setFormatter(logging.Formatter(fmt))
+    root.addHandler(fh)
+    root.addHandler(sh)
+
+
+logger = logging.getLogger(__name__)
+
+
+def prompt_reindex_on_startup() -> None:
+    """
+    Предлагает при старте выполнить полную переиндексацию (как `reindex.py --role all`).
+    """
+    tip = (
+        "\n💡 Переиндексация нужна после изменения файлов в assistant_api/knowledge/*/ "
+        "или при первом запуске.\n"
+        "Выполнить переиндексацию всех баз знаний сейчас? [y/N]: "
+    )
+    answer = input(tip).strip().lower()
+    if answer not in ("y", "yes", "д", "да"):
+        print("Переиндексация пропущена. При необходимости выполните: python reindex.py --role all\n")
+        return
+    try:
+        reindex_all_roles()
+    except Exception as e:
+        logger.exception("Ошибка переиндексации: %s", e)
+        print(f"❌ Ошибка переиндексации: {e}")
+        sys.exit(1)
+
+
 def print_banner():
-    """Вывод приветственного баннера."""
     banner = """
 ╔══════════════════════════════════════════════════════════╗
-║         RAG Ассистент (API Mode)                        ║
-║  Retrieval-Augmented Generation через OpenAI API        ║
+║   Корпоративные нейроассистенты (OpenAI + RAG)           ║
+║   Учебный проект: автодилер                              ║
 ╚══════════════════════════════════════════════════════════╝
-    """
+"""
     print(banner)
-    print("Введите 'exit' или 'quit' для выхода")
-    print("Введите 'stats' для просмотра статистики")
-    print("Введите 'clear' для очистки кеша\n")
+    if EMBEDDINGS_BACKEND == "local":
+        print(
+            "Эмбеддинги: локально (sentence-transformers). Ответы в чате — через OpenAI.\n"
+            "Смена openai↔local требует переиндексации (разная размерность векторов).\n"
+        )
+    print("Команды: exit | quit — выход; stats — статистика; clear — очистить кеш текущей роли;")
+    print("          role — сменить роль; help — подсказка по ролям.\n")
+
+
+def print_help():
+    print("\nДоступные роли:")
+    for i, r in enumerate(ASSISTANT_ROLES, 1):
+        print(f"  {i}. {r}: {ROLE_LABELS[r]}")
+    print()
+
+
+def choose_role_interactive() -> str:
+    print_help()
+    while True:
+        raw = input("Выберите номер роли (1-3) или ключ (hr/post_sales/sales): ").strip().lower()
+        if raw in ("1", "hr"):
+            return "hr"
+        if raw in ("2", "post_sales"):
+            return "post_sales"
+        if raw in ("3", "sales"):
+            return "sales"
+        print("Неверный ввод. Попробуйте снова.")
 
 
 def print_response(result: dict):
-    """
-    Форматированный вывод ответа.
-    
-    Args:
-        result: словарь с результатом запроса
-    """
     print(f"\n{'─'*60}")
     print(f"📝 Вопрос: {result['query']}")
     print(f"{'─'*60}")
-    
-    # Индикатор источника ответа
-    if result['from_cache']:
-        print("💾 Источник: КЕШ")
-        if 'cached_at' in result:
+    print(f"👤 Роль: {result.get('role', '?')}")
+
+    if result.get("from_cache"):
+        hit = result.get("cache_hit", "exact")
+        print("💾 Источник: КЕШ (%s)" % hit)
+        if hit == "semantic" and result.get("similarity") is not None:
+            print(f"   Сходство: {result['similarity']:.4f}")
+        if result.get("cached_at"):
             print(f"   Сохранено: {result['cached_at']}")
     else:
-        print(f"🌐 Источник: OpenAI API ({result.get('model', 'LLM')})")
-        print(f"   Использовано документов: {len(result.get('context_docs', []))}")
-    
+        print(f"🌐 Источник: OpenAI ({result.get('model', 'LLM')})")
+        print(f"   Фрагментов контекста: {len(result.get('context_docs', []))}")
+
     print(f"\n💬 Ответ:\n{result['answer']}")
-    
-    # Показать контекст (опционально)
-    if not result['from_cache'] and result.get('context_docs'):
-        print(f"\n📚 Использованный контекст:")
-        for i, doc in enumerate(result['context_docs'][:2], 1):  # Показываем только 2 первых
-            preview = doc['text'][:150] + "..." if len(doc['text']) > 150 else doc['text']
+
+    if not result.get("from_cache") and result.get("context_docs"):
+        print("\n📚 Фрагменты контекста (кратко):")
+        for i, doc in enumerate(result["context_docs"][:2], 1):
+            text = doc["text"] if isinstance(doc, dict) else str(doc)
+            preview = text[:150] + "..." if len(text) > 150 else text
             print(f"   {i}. {preview}")
-    
+
     print(f"{'─'*60}\n")
 
 
 def print_stats(pipeline: RAGPipeline):
-    """
-    Вывод статистики системы.
-    
-    Args:
-        pipeline: экземпляр RAG pipeline
-    """
     stats = pipeline.get_stats()
-    
     print(f"\n{'═'*60}")
-    print("📊 СТАТИСТИКА СИСТЕМЫ")
+    print("📊 СТАТИСТИКА")
     print(f"{'═'*60}")
-    
+    print(f"Роль: {stats['role']}")
+    vs = stats["vector_store"]
     print("\n🗄️  Векторное хранилище:")
-    print(f"   Коллекция: {stats['vector_store']['name']}")
-    print(f"   Документов: {stats['vector_store']['count']}")
-    print(f"   Директория: {stats['vector_store']['persist_directory']}")
-    
-    print("\n💾 Кеш:")
-    print(f"   Записей: {stats['cache']['total_entries']}")
-    print(f"   Размер БД: {stats['cache']['db_size_mb']:.2f} MB")
-    if stats['cache']['oldest_entry']:
-        print(f"   Первая запись: {stats['cache']['oldest_entry']}")
-    if stats['cache']['newest_entry']:
-        print(f"   Последняя запись: {stats['cache']['newest_entry']}")
-    
-    print(f"\n🤖 Модель: {stats['model']}")
-    print(f"🌐 Режим: {stats['mode']}")
+    print(f"   Коллекция: {vs['name']}")
+    print(f"   Документов (чанков): {vs['count']}")
+    print(f"   Папка Chroma: {vs['persist_directory']}")
+    ch = stats["cache"]
+    print("\n💾 Кеш (точное + семантическое совпадение):")
+    print(f"   Записей: {ch['total_entries']}")
+    print(f"   Порог семантики: {ch.get('semantic_threshold', '?')}")
+    print(f"   Размер БД: {ch['db_size_mb']:.2f} MB")
+    if ch.get("oldest_entry"):
+        print(f"   Первая запись: {ch['oldest_entry']}")
+    if ch.get("newest_entry"):
+        print(f"   Последняя запись: {ch['newest_entry']}")
+    print(f"\n🤖 Модель чата: {stats['model']}")
     print(f"{'═'*60}\n")
 
 
 def main():
-    """Главная функция приложения."""
+    setup_logging()
     print_banner()
-    
-    # Проверка наличия API ключа
+
     if not os.getenv("OPENAI_API_KEY"):
-        print("❌ Ошибка: переменная окружения OPENAI_API_KEY не установлена")
-        print("\nУстановите её следующим образом:")
-        print("  Windows (PowerShell): $env:OPENAI_API_KEY='your-key'")
-        print("  Windows (CMD): set OPENAI_API_KEY=your-key")
-        print("  Linux/Mac: export OPENAI_API_KEY='your-key'")
+        print("❌ Не задан OPENAI_API_KEY. Добавьте ключ в .env в корне проекта.")
         sys.exit(1)
-    
+
+    prompt_reindex_on_startup()
+
+    role = choose_role_interactive()
+    p = get_prompt(role)
+    print(f"\n✅ Роль: {ROLE_LABELS[role]}")
+    print(f"   {p['greeting']}\n")
+
     try:
-        # Инициализация RAG pipeline
-        print("🚀 Инициализация системы...\n")
-        pipeline = RAGPipeline(
-            collection_name="api_rag_collection",
-            cache_db_path="api_rag_cache.db",
-            data_file="data",
-            model="gpt-4o-mini"
-        )
-        print("\n✅ Система готова к работе!\n")
-        
+        logger.info("Старт приложения, роль=%s", role)
+        pipeline = RAGPipeline(role=role)
+        print("✅ Система готова. Введите вопрос.\n")
     except Exception as e:
+        logger.exception("Ошибка инициализации: %s", e)
         print(f"❌ Ошибка инициализации: {e}")
         sys.exit(1)
-    
-    # Основной цикл взаимодействия
+
     while True:
         try:
-            # Получение запроса от пользователя
             user_input = input("💭 Ваш вопрос: ").strip()
-            
-            # Обработка специальных команд
-            if user_input.lower() in ['exit', 'quit', 'q']:
+
+            if user_input.lower() in ("exit", "quit", "q"):
                 print("\n👋 До свидания!")
                 break
-            
-            if user_input.lower() == 'stats':
+
+            if user_input.lower() == "stats":
                 print_stats(pipeline)
                 continue
-            
-            if user_input.lower() == 'clear':
-                confirm = input("⚠️  Вы уверены, что хотите очистить кеш? (yes/no): ")
-                if confirm.lower() in ['yes', 'y', 'да']:
-                    pipeline.cache.clear()
-                    print("✅ Кеш очищен")
+
+            if user_input.lower() == "help":
+                print_help()
                 continue
-            
+
+            if user_input.lower() == "role":
+                role = choose_role_interactive()
+                p = get_prompt(role)
+                print(f"\n✅ Смена роли: {ROLE_LABELS[role]}")
+                print(f"   {p['greeting']}\n")
+                try:
+                    pipeline = RAGPipeline(role=role)
+                    print("✅ Готово.\n")
+                except Exception as e:
+                    logger.exception("Ошибка смены роли: %s", e)
+                    print(f"❌ {e}")
+                continue
+
+            if user_input.lower() == "clear":
+                confirm = input("Очистить кеш только для текущей роли? (yes/no): ")
+                if confirm.lower() in ("yes", "y", "да"):
+                    pipeline.cache.clear(role=pipeline.role)
+                    print("✅ Кеш для текущей роли очищен")
+                continue
+
             if not user_input:
-                print("⚠️  Пожалуйста, введите вопрос\n")
+                print("⚠️  Введите вопрос\n")
                 continue
-            
-            # Обработка запроса через RAG pipeline
+
             result = pipeline.query(user_input)
-            
-            # Вывод результата
             print_response(result)
-            
+
         except KeyboardInterrupt:
-            print("\n\n👋 Прервано пользователем. До свидания!")
+            print("\n\n👋 Прервано. До свидания!")
             break
         except Exception as e:
+            logger.exception("Ошибка обработки: %s", e)
             print(f"\n❌ Ошибка: {e}\n")
 
 
 if __name__ == "__main__":
     main()
-

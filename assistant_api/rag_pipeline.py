@@ -1,236 +1,161 @@
 """
-Основной RAG pipeline для API режима.
-Управляет потоком: запрос -> кеш -> vector search -> LLM -> ответ -> кеш.
+RAG pipeline: семантический кеш → поиск в Chroma → OpenAI Chat (только одна роль за раз).
 """
 
-from typing import Dict, Any, List
+from __future__ import annotations
+
+import logging
 import os
 from pathlib import Path
-from openai import OpenAI
+from typing import Any
 
+from cache import SemanticRAGCache
+from config import (
+    ASSISTANT_ROLES,
+    DEFAULT_CACHE_DB,
+    DEFAULT_CHAT_MODEL,
+    LLM_MAX_TOKENS,
+    LLM_TEMPERATURE,
+    collection_name_for_role,
+    knowledge_dir_for_role,
+)
+from embeddings import embed_text
+from openai_client import create_openai_client
+from prompts import build_system_prompt
 from vector_store import VectorStore
-from cache import RAGCache
+
+logger = logging.getLogger(__name__)
 
 
 class RAGPipeline:
-    """Основной pipeline для RAG системы в API режиме."""
-    
-    def __init__(self, 
-                 collection_name: str = "rag_collection",
-                 cache_db_path: str = "rag_cache.db",
-                 data_file: str = "data",
-                 model: str = "gpt-4o-mini"):
-        """
-        Инициализация RAG pipeline.
-        
-        Args:
-            collection_name: имя коллекции в ChromaDB
-            cache_db_path: путь к базе данных кеша
-            data_file: путь к файлу с документами
-            model: модель OpenAI для генерации ответов
-        """
-        # Проверка API ключа
+    """Один экземпляр на выбранную роль (hr / post_sales / sales)."""
+
+    def __init__(
+        self,
+        role: str,
+        collection_name: str | None = None,
+        cache_db_path: str = DEFAULT_CACHE_DB,
+        data_dir: str | None = None,
+        model: str | None = None,
+    ):
+        if role not in ASSISTANT_ROLES:
+            raise ValueError(f"Роль должна быть одной из {ASSISTANT_ROLES}, получено: {role}")
+
         if not os.getenv("OPENAI_API_KEY"):
             raise ValueError("OPENAI_API_KEY не установлен")
-        
-        self.model = model
-        self.openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+        self.role = role
+        self.model = model or DEFAULT_CHAT_MODEL
+        self.openai_client = create_openai_client()
+
         project_dir = Path(__file__).resolve().parent
-        resolved_data_file = str((project_dir / data_file).resolve()) if not Path(data_file).is_absolute() else data_file
-        resolved_cache_db_path = str((project_dir / cache_db_path).resolve()) if not Path(cache_db_path).is_absolute() else cache_db_path
+        self._collection_name = collection_name or collection_name_for_role(role)
+        data_rel = data_dir or knowledge_dir_for_role(role)
+        self._data_path = str((project_dir / data_rel).resolve())
+        resolved_cache = str((project_dir / cache_db_path).resolve()) if not Path(cache_db_path).is_absolute() else cache_db_path
+
         force_reindex = os.getenv("RAG_FORCE_REINDEX", "0").strip().lower() in {"1", "true", "yes", "y"}
-        
-        # Инициализация компонентов
-        print("Инициализация векторного хранилища...")
-        self.vector_store = VectorStore(collection_name=collection_name)
-        
-        # Загрузка документов: при необходимости принудительно переиндексируем
-        if self.vector_store.collection.count() == 0 or force_reindex:
-            print(f"Загрузка документов из {resolved_data_file}...")
-            self.vector_store.load_documents(resolved_data_file, force_reload=force_reindex)
-        
-        print("Инициализация кеша...")
-        self.cache = RAGCache(db_path=resolved_cache_db_path)
-        
-        print("RAG Pipeline инициализирован (API mode)")
-    
-    def _create_prompt(self, query: str, context_docs: List[Dict[str, Any]]) -> str:
-        """
-        Создание промпта для LLM с контекстом.
-        
-        Args:
-            query: вопрос пользователя
-            context_docs: релевантные документы из векторного хранилища
-            
-        Returns:
-            сформированный промпт
-        """
-        # Формирование контекста из документов
-        context_parts = []
+
+        logger.info("Инициализация векторного хранилища: коллекция %s", self._collection_name)
+        self.vector_store = VectorStore(collection_name=self._collection_name)
+
+        chunk_count = self.vector_store.collection.count()
+        # Индексация (эмбеддинги + Chroma) только при явном запросе: ответ «y» при старте
+        # (reindex_all_roles) или команда `python reindex.py`. Без этого пустая коллекция — ошибка.
+        if chunk_count == 0 and not force_reindex:
+            raise RuntimeError(
+                "Векторная база для этой роли пуста. Перезапустите приложение и на вопрос о "
+                "переиндексации ответьте «y», либо выполните из корня проекта:\n"
+                "  python reindex.py --role all\n"
+                "или для одной роли: python reindex.py --role hr"
+            )
+
+        if chunk_count == 0 or force_reindex:
+            logger.info("Загрузка документов из %s", self._data_path)
+            self.vector_store.load_documents(self._data_path, force_reload=force_reindex)
+
+        def _embed_for_cache(q: str) -> list[float]:
+            return embed_text(q, self.openai_client)
+
+        self.cache = SemanticRAGCache(db_path=resolved_cache, embed_fn=_embed_for_cache)
+        self._system_prompt = build_system_prompt(role)
+
+        logger.info("RAG pipeline готов: роль=%s, модель=%s", role, self.model)
+
+    def _user_message(self, query: str, context_docs: list[dict[str, Any]]) -> str:
+        parts = []
         for i, doc in enumerate(context_docs, 1):
-            context_parts.append(f"Документ {i}:\n{doc['text']}\n")
-        
-        context = "\n".join(context_parts)
-        
-        # Создание промпта
-        prompt = f"""Ты - полезный AI ассистент. Ответь на вопрос пользователя на основе предоставленного контекста.
+            parts.append(f"Фрагмент {i}:\n{doc['text']}\n")
+        context_block = "\n".join(parts) if parts else "(контекст пуст — в базе ничего не найдено)"
+        return f"""Контекст из базы знаний:
+{context_block}
 
-Контекст:
-{context}
+Вопрос пользователя: {query}
 
-Вопрос: {query}
+Ответь по правилам из системной инструкции, опираясь на контекст."""
 
-Инструкции:
-- Отвечай только на основе предоставленного контекста
-- Если в контексте нет информации для ответа, скажи об этом
-- Будь точным и кратким
-- Отвечай на русском языке
-
-Ответ:"""
-        
-        return prompt
-    
-    def _generate_answer(self, prompt: str) -> str:
-        """
-        Генерация ответа через OpenAI API.
-        
-        Args:
-            prompt: промпт для модели
-            
-        Returns:
-            сгенерированный ответ
-        """
+    def _generate_answer(self, user_message: str) -> str:
         response = self.openai_client.chat.completions.create(
             model=self.model,
             messages=[
-                {"role": "system", "content": "Ты - полезный AI ассистент, который отвечает на вопросы на основе предоставленного контекста."},
-                {"role": "user", "content": prompt}
+                {"role": "system", "content": self._system_prompt},
+                {"role": "user", "content": user_message},
             ],
-            temperature=0.3,  # Низкая температура для более точных ответов
-            max_tokens=500
+            temperature=LLM_TEMPERATURE,
+            max_tokens=LLM_MAX_TOKENS,
         )
-        
-        return response.choices[0].message.content.strip()
-    
-    def query(self, user_query: str, use_cache: bool = True) -> Dict[str, Any]:
-        """
-        Основной метод для обработки запроса пользователя через API.
-        
-        Поток:
-        1. Проверка кеша
-        2. Если в кеше нет - поиск в векторном хранилище
-        3. Формирование промпта с контекстом
-        4. Генерация ответа через LLM API
-        5. Сохранение в кеш
-        
-        Args:
-            user_query: запрос пользователя
-            use_cache: использовать ли кеш
-            
-        Returns:
-            словарь с ответом и метаданными
-        """
-        print(f"\n{'='*60}")
-        print(f"Запрос: {user_query}")
-        print(f"{'='*60}")
-        
-        # Шаг 1: Проверка кеша
+        content = response.choices[0].message.content
+        return (content or "").strip()
+
+    def query(self, user_query: str, use_cache: bool = True) -> dict[str, Any]:
+        logger.info("Запрос (role=%s): %s", self.role, user_query[:200])
+
         if use_cache:
-            print("[*] Проверка кеша...")
-            cached_result = self.cache.get(user_query)
-            
-            if cached_result:
-                print("[+] Ответ найден в кеше")
+            cached = self.cache.get(user_query, self.role)
+            if cached:
+                raw_ctx = cached.get("context")
+                if raw_ctx and isinstance(raw_ctx, list) and raw_ctx and isinstance(raw_ctx[0], str):
+                    context_docs = [{"text": t} for t in raw_ctx]
+                else:
+                    context_docs = raw_ctx or []
                 return {
                     "query": user_query,
-                    "answer": cached_result["answer"],
+                    "answer": cached["answer"],
                     "from_cache": True,
-                    "context_docs": cached_result.get("context"),
-                    "cached_at": cached_result.get("created_at")
+                    "cache_hit": cached.get("cache_hit"),
+                    "similarity": cached.get("similarity"),
+                    "context_docs": context_docs,
+                    "cached_at": cached.get("created_at"),
+                    "role": self.role,
+                    "model": self.model,
                 }
-            else:
-                print("[-] Ответ не найден в кеше")
-        
-        # Шаг 2: Поиск релевантных документов
-        print("[*] Поиск релевантных документов через API...")
+
         context_docs = self.vector_store.search(user_query, top_k=3)
-        print(f"[+] Найдено {len(context_docs)} релевантных документов")
-        
-        # Шаг 3: Формирование промпта
-        print("[*] Формирование промпта...")
-        prompt = self._create_prompt(user_query, context_docs)
-        
-        # Шаг 4: Генерация ответа через API
-        print(f"[*] Генерация ответа через OpenAI API ({self.model})...")
-        answer = self._generate_answer(prompt)
-        print("[+] Ответ получен от API")
-        
-        # Шаг 5: Сохранение в кеш
+        logger.info("Найдено фрагментов контекста: %s", len(context_docs))
+
+        user_message = self._user_message(user_query, context_docs)
+        answer = self._generate_answer(user_message)
+        logger.info("Ответ сгенерирован моделью")
+
         if use_cache:
-            print("[*] Сохранение в кеш...")
-            context_for_cache = [doc['text'] for doc in context_docs]
-            self.cache.set(user_query, answer, context_for_cache)
-            print("[+] Сохранено в кеш")
-        
+            ctx_list = [d["text"] for d in context_docs]
+            self.cache.set(user_query, self.role, answer, ctx_list)
+
         return {
             "query": user_query,
             "answer": answer,
             "from_cache": False,
             "context_docs": context_docs,
             "model": self.model,
-            "mode": "API"
+            "role": self.role,
+            "mode": "openai",
         }
-    
-    def get_stats(self) -> Dict[str, Any]:
-        """
-        Получение статистики системы.
-        
-        Returns:
-            словарь со статистикой
-        """
+
+    def get_stats(self) -> dict[str, Any]:
         return {
+            "role": self.role,
             "vector_store": self.vector_store.get_collection_stats(),
             "cache": self.cache.get_stats(),
             "model": self.model,
-            "mode": "API"
+            "mode": "openai",
         }
-
-
-if __name__ == "__main__":
-    # Тестирование RAG pipeline в API режиме
-    import sys
-    
-    try:
-        pipeline = RAGPipeline()
-        
-        # Тестовые запросы
-        test_queries = [
-            "Кто не может получать премию за рекомендацию кандидата?",
-            "Какая одежда считается недопустимой по дресс-коду?",
-            "Когда можно использовать корпоративное такси?"
-        ]
-        
-        for query in test_queries:
-            result = pipeline.query(query)
-            print(f"\n{'='*60}")
-            print(f"Вопрос: {result['query']}")
-            print(f"Из кеша: {result['from_cache']}")
-            print(f"Ответ: {result['answer']}")
-            print(f"{'='*60}\n")
-        
-        # Повторный запрос (должен быть из кеша)
-        print("\n--- Повторный запрос ---")
-        result = pipeline.query(test_queries[0])
-        print(f"Из кеша: {result['from_cache']}")
-        
-        # Статистика
-        stats = pipeline.get_stats()
-        print(f"\nСтатистика системы:")
-        print(f"Векторное хранилище: {stats['vector_store']}")
-        print(f"Кеш: {stats['cache']}")
-        print(f"Режим: {stats['mode']}")
-        
-    except Exception as e:
-        print(f"Ошибка: {e}")
-        sys.exit(1)
-

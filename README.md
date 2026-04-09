@@ -1,186 +1,79 @@
-# RAG-ассистент с кэшированием
+# Корпоративные нейроассистенты (OpenAI + RAG)
 
-Два независимых CLI-приложения на архитектуре **RAG** (Retrieval-Augmented Generation): ответы формируются на основе **ваших документов**, а не «из головы» модели. Подходит для внутренней базы знаний, поддержки клиентов и сотрудников, FAQ по регламентам и продуктовым материалам.
+Учебный CLI-проект: три роли ассистента для автодилера — **HR**, **постпродажа**, **продажи**. База знаний подтягивается из **Google Docs** (просмотр по ссылке; URL по умолчанию в `assistant_api/config.py`, переопределение в `.env`), с **семантическим кешированием** повторяющихся вопросов. Интеграция только с **OpenAI**.
 
-### Зачем это бизнесу
+## Возможности
 
-- **Быстрые ответы по фактам** — пользователь задаёт вопрос, система находит релевантные фрагменты в загруженных файлах и собирает ответ.
-- **Экономия и скорость** — повторяющиеся вопросы обслуживаются из **локального кэша** в SQLite: меньше задержка, ниже нагрузка на API и стоимость запросов к LLM.
-- **Два варианта LLM** — выбор провайдера под задачу и политику компании:
-  - `assistant_api` — **OpenAI API**;
-  - `assistant_giga` — **GigaChat API** (актуально, если нужен российский провайдер или отдельная интеграция).
-- **Актуальность базы** — переиндексация после обновления файлов в `data`; хранение векторного индекса локально в **ChromaDB**.
-- **Контроль качества** — скрипты оценки через **RAGAS** помогают понять, насколько ответы опираются на контекст и насколько они релевантны вопросу.
+- Три изолированные коллекции ChromaDB (`corp_hr`, `corp_post_sales`, `corp_sales`); источник текста при индексации — Google Docs по роли.
+- Промпты вынесены в `assistant_api/prompts.py` (цели, сценарии, ограничения, примеры FAQ).
+- **Семантический кеш** (SQLite): сначала точное совпадение вопроса, затем сравнение embedding вопроса с сохранёнными (cosine similarity), порог по умолчанию `0.88` (`SEMANTIC_CACHE_THRESHOLD` в `.env`).
+- **Логи**: консоль + файл `assistant_api/logs/app.log`.
+- Параметры LLM: температура **0.4**, **max_tokens 500** (`assistant_api/config.py`).
 
-### Техническая основа (оба варианта)
+## Стек
 
-- локальное векторное хранилище **ChromaDB**;
-- кэш ответов в **SQLite**;
-- общие зависимости в `requirements.txt`.
+| Компонент | Технологии |
+|-----------|------------|
+| Язык | Python 3.12 |
+| Чат (LLM) | OpenAI API (при необходимости — `OPENAI_BASE_URL` в `.env`) |
+| Эмбеддинги RAG | OpenAI Embeddings **или** локально `sentence-transformers` (`EMBEDDINGS_BACKEND=local`, по умолчанию — удобно при 403 region на Embeddings) |
+| Векторный поиск | ChromaDB (локально) |
+| Кеш | SQLite |
 
----
-
-## 1) Требования
-
-- Python `3.12`
-- Windows PowerShell (примеры ниже для PowerShell)
-
-Проверка версии:
+## Установка
 
 ```powershell
-python --version
-```
-
----
-
-## 2) Установка зависимостей
-
-Из корня проекта:
-
-```powershell
+cd "путь\к\проекту"
 python -m venv venv
 .\venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
 pip install -r requirements.txt
-```
-
-Если обычная установка медленная/падает по сети, можно использовать mirror:
-
-```powershell
-pip install -r requirements.txt -i https://mirrors.aliyun.com/pypi/simple/ --timeout 120 --retries 10
-```
-
----
-
-## 3) Настройка `.env`
-
-1. Скопируйте шаблон:
-
-```powershell
 Copy-Item .env.example .env
+# Укажите OPENAI_API_KEY в .env
 ```
 
-2. Откройте `.env` и заполните ключи:
+Опционально: установить Python 3.12 через Windows — `winget install Python.Python.3.12`. Если `pypi.org` недоступен, можно указать зеркало, например:
 
-- `OPENAI_API_KEY` — для `assistant_api` и (опционально) RAGAS;
-- `GIGACHAT_AUTH_KEY`, `GIGACHAT_RQUID` — для `assistant_giga`.
+`python -m pip install -r requirements.txt -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com`
 
-Важно:
+## Переиндексация базы знаний
 
-- `.env` не должен попадать в Git (уже добавлено в `.gitignore`).
-- В репозиторий добавляйте только `.env.example`.
+После изменения текста в Google Docs (или ссылок в `config` / `.env`) выполните (из корня репозитория):
 
----
+```powershell
+.\venv\Scripts\python.exe reindex.py --role hr
+.\venv\Scripts\python.exe reindex.py --role post_sales
+.\venv\Scripts\python.exe reindex.py --role sales
+```
 
-## 4) Запуск приложений
+Все роли сразу:
 
-### OpenAI-проект
+```powershell
+.\venv\Scripts\python.exe reindex.py --role all
+```
+
+## Запуск ассистента в терминале
 
 ```powershell
 .\venv\Scripts\python.exe assistant_api\app.py
 ```
 
-### GigaChat-проект
+Дальше выберите роль (1 — HR, 2 — постпродажа, 3 — продажи). Команды: `stats`, `clear`, `role`, `help`, `exit`.
 
-```powershell
-.\venv\Scripts\python.exe assistant_giga\app.py
-```
+## Оценка качества (RAGAS, опционально)
 
-Команды внутри CLI:
-
-- `stats` — статистика кеша;
-- `clear` — очистка кеша;
-- `exit` или `quit` — выход.
-
----
-
-## 5) Переиндексация базы знаний
-
-Если вы обновили файлы в `assistant_api/data` или `assistant_giga/data`, выполните переиндексацию:
-
-```powershell
-.\venv\Scripts\python.exe reindex.py --project api
-.\venv\Scripts\python.exe reindex.py --project giga
-```
-
-Или сразу оба:
-
-```powershell
-.\venv\Scripts\python.exe reindex.py --project both
-```
-
----
-
-## 6) Оценка качества через RAGAS
-
-### OpenAI-проект
+Для роли HR (тот же источник, что в `DEFAULT_KNOWLEDGE_GOOGLE_DOCS`):
 
 ```powershell
 .\venv\Scripts\python.exe assistant_api\evaluate_ragas.py
 ```
 
-### GigaChat-проект
+## Локальные данные (не в Git)
 
-```powershell
-.\venv\Scripts\python.exe assistant_giga\evaluate_ragas.py
-```
+- `assistant_api/chroma_db/`, `assistant_api/*.db`, `assistant_api/logs/`, `.env`, `venv/`
 
-Примечание по `assistant_giga/evaluate_ragas.py`:
+Папки `assistant_api/knowledge/<роль>/` в репозитории пустые (заглушки `.gitkeep`). Папка `assistant_api/data/` (если создадите локально) в Git не отслеживается.
 
-- для embeddings по умолчанию используется `huggingface`;
-- при недоступности OpenAI (например, `403 unsupported_country_region_territory`) скрипт завершится быстро с понятным сообщением, без долгого "зависания".
+## Лицензия
 
-Опциональные переменные:
-
-- `RAGAS_EMBEDDINGS_PROVIDER` = `huggingface` или `openai`
-- `RAGAS_HF_MODEL` (модель локальных embeddings)
-- `RAGAS_OPENAI_EMBEDDINGS_MODEL`
-
----
-
-## 7) Где хранятся данные
-
-- Кеш ответов:
-  - `assistant_api/api_rag_cache.db`
-  - `assistant_giga/gigachat_rag_cache.db`
-- Индексы Chroma:
-  - `assistant_api/chroma_db`
-  - `assistant_giga/chroma_db`
-- Документы базы знаний:
-  - `assistant_api/data`
-  - `assistant_giga/data`
-
-Эти файлы/папки игнорируются Git.
-
----
-
-## 8) Подготовка к GitHub
-
-Перед коммитом проверьте:
-
-```powershell
-git status
-```
-
-В `git status` не должно быть:
-
-- `.env`
-- `*.db`
-- `chroma_db/*`
-- содержимого `assistant_api/data/*`, `assistant_giga/data/*`
-- `venv/*`
-
----
-
-## 9) Быстрый старт (кратко)
-
-```powershell
-python -m venv venv
-.\venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-Copy-Item .env.example .env
-# заполнить ключи в .env
-.\venv\Scripts\python.exe reindex.py --project both
-.\venv\Scripts\python.exe assistant_giga\app.py
-```
-
+Укажите лицензию при публикации репозитория, если планируете открытый код.

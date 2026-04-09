@@ -20,6 +20,11 @@ env/
 .env.*
 !.env.example
 
+# Частые случайные утечки (не кладите сюда реальные ключи)
+client_secret*.json
+*credentials*.json
+*.pem
+
 # =========================
 # Local databases and caches
 # =========================
@@ -35,13 +40,11 @@ env/
 tmp_chroma_test/
 tmp_chroma_test2/
 
-# =========================
-# Project data (can be confidential)
-# =========================
-assistant_api/data/*
-assistant_giga/data/*
-!assistant_api/data/.gitkeep
-!assistant_giga/data/.gitkeep
+# Логи приложения (создаются при запуске app.py)
+assistant_api/logs/
+
+# Локальная папка data (код использует knowledge/; сюда можно класть свои выгрузки)
+assistant_api/data/
 
 # =========================
 # IDE / OS

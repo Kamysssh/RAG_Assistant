@@ -3,14 +3,22 @@
 Обрабатывает загрузку документов, chunking и поиск по векторам.
 """
 
-import chromadb
-from typing import List, Dict, Any
+import logging
 import os
-from openai import OpenAI
-from dotenv import load_dotenv
-from pathlib import Path
-from datetime import datetime
+import re
 import shutil
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List
+
+import chromadb
+from dotenv import load_dotenv
+
+from config import EMBEDDINGS_BACKEND
+from embeddings import embed_text
+from openai_client import create_openai_client
+
+logger = logging.getLogger(__name__)
 
 
 env_path = Path(__file__).parent.parent / '.env'
@@ -43,13 +51,19 @@ class VectorStore:
         # Получение или создание коллекции
         try:
             self.collection = self.client.get_collection(name=collection_name)
-            print(f"Коллекция '{collection_name}' загружена. Документов: {self.collection.count()}")
+            logger.info(
+                "Коллекция '%s' загружена, документов: %s",
+                collection_name,
+                self.collection.count(),
+            )
         except Exception:
             self.collection = self._create_collection()
-            print(f"Создана новая коллекция '{collection_name}'")
+            logger.info("Создана новая коллекция '%s'", collection_name)
         
-        # OpenAI клиент для создания embeddings
-        self.openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        # Для EMBEDDINGS_BACKEND=openai нужен клиент; для local — только Chroma + локальная модель
+        self.openai_client = (
+            create_openai_client() if EMBEDDINGS_BACKEND == "openai" else None
+        )
 
     def _create_collection(self):
         """Создание новой коллекции с базовыми настройками."""
@@ -72,11 +86,13 @@ class VectorStore:
             )
             if persist_path.exists():
                 shutil.move(str(persist_path), str(backup_path))
-                print(
-                    f"[WARN] Локальная база ChromaDB повреждена, создан бэкап: {backup_path}"
+                logger.warning(
+                    "Локальная база ChromaDB повреждена, создан бэкап: %s", backup_path
                 )
             else:
-                print("[WARN] Не удалось открыть ChromaDB, выполняется чистая инициализация")
+                logger.warning(
+                    "Не удалось открыть ChromaDB, выполняется чистая инициализация"
+                )
 
             try:
                 return chromadb.PersistentClient(path=self.persist_directory)
@@ -90,7 +106,10 @@ class VectorStore:
                     )
                     fallback_path.mkdir(parents=True, exist_ok=True)
                     self.persist_directory = str(fallback_path)
-                    print(f"[WARN] Переключение на новую директорию ChromaDB: {self.persist_directory}")
+                    logger.warning(
+                        "Переключение на новую директорию ChromaDB: %s",
+                        self.persist_directory,
+                    )
                     return chromadb.PersistentClient(
                         path=self.persist_directory
                     )
@@ -227,7 +246,6 @@ class VectorStore:
             список чанков
         """
         # Разделяем на предложения
-        import re
         sentences = re.split(r'([.!?]+\s+)', paragraph)
         
         # Собираем предложения обратно с их разделителями
@@ -281,10 +299,10 @@ class VectorStore:
         """
         # Проверка, не загружены ли уже документы
         if self.collection.count() > 0 and not force_reload:
-            print("Документы уже загружены в коллекцию")
+            logger.info("Документы уже загружены в коллекцию")
             return
         if force_reload and self.collection.count() > 0:
-            print("Обнаружена существующая коллекция. Выполняется переиндексация...")
+            logger.info("Переиндексация: удаление и пересоздание коллекции")
             self.client.delete_collection(name=self.collection_name)
             self.collection = self._create_collection()
 
@@ -318,7 +336,9 @@ class VectorStore:
 
         # Разбиение на чанки
         chunks = self._chunk_text(text)
-        print(f"Загружено файлов: {len(source_files)}. Текст разбит на {len(chunks)} чанков")
+        logger.info(
+            "Загружено файлов: %s, чанков: %s", len(source_files), len(chunks)
+        )
         
         # Создание embeddings и добавление в ChromaDB
         documents = []
@@ -326,7 +346,6 @@ class VectorStore:
         embeddings = []
         
         for i, chunk in enumerate(chunks):
-            # Создание embedding через OpenAI
             embedding = self._create_embedding(chunk)
             
             documents.append(chunk)
@@ -334,7 +353,7 @@ class VectorStore:
             embeddings.append(embedding)
             
             if (i + 1) % 10 == 0:
-                print(f"Обработано {i + 1}/{len(chunks)} чанков")
+                logger.info("Обработано чанков: %s/%s", i + 1, len(chunks))
         
         # Добавление в ChromaDB батчами
         self.collection.add(
@@ -343,23 +362,13 @@ class VectorStore:
             ids=ids
         )
         
-        print(f"Загружено {len(chunks)} документов в коллекцию '{self.collection_name}'")
+        logger.info(
+            "В коллекцию '%s' добавлено %s чанков", self.collection_name, len(chunks)
+        )
     
     def _create_embedding(self, text: str) -> List[float]:
-        """
-        Создание векторного представления текста через OpenAI.
-        
-        Args:
-            text: текст для векторизации
-            
-        Returns:
-            вектор embeddings
-        """
-        response = self.openai_client.embeddings.create(
-            input=text,
-            model="text-embedding-3-small"
-        )
-        return response.data[0].embedding
+        """Векторизация фрагмента для ChromaDB (та же модель, что и для семантического кеша)."""
+        return embed_text(text, self.openai_client)
     
     def search(self, query: str, top_k: int = 3) -> List[Dict[str, Any]]:
         """
@@ -408,27 +417,30 @@ class VectorStore:
 
 
 if __name__ == "__main__":
-    # Тестирование векторного хранилища
+    # Ручная проверка: из каталога assistant_api — python vector_store.py
     import sys
-    
+
     if not os.getenv("OPENAI_API_KEY"):
         print("Ошибка: установите переменную окружения OPENAI_API_KEY")
         sys.exit(1)
-    
+
+    _here = Path(__file__).resolve().parent
+    _knowledge_hr = _here / "knowledge" / "hr"
     vector_store = VectorStore(collection_name="test_collection")
-    
-    # Загрузка документов
-    if os.path.exists("data"):
-        vector_store.load_documents("data")
-    
-    # Поиск
-    results = vector_store.search("Когда выплачивается премия за рекомендацию кандидата?", top_k=3)
+    if _knowledge_hr.is_dir():
+        vector_store.load_documents(str(_knowledge_hr))
+    else:
+        print(f"Нет папки {_knowledge_hr} — положите .txt или передайте путь в коде.")
+        sys.exit(1)
+
+    results = vector_store.search(
+        "Когда выплачивается премия за рекомендацию кандидата?", top_k=3
+    )
     print("\nРезультаты поиска:")
     for i, doc in enumerate(results, 1):
         print(f"\n{i}. {doc['text'][:200]}...")
         print(f"   Distance: {doc['distance']}")
-    
-    # Статистика
+
     stats = vector_store.get_collection_stats()
     print(f"\nСтатистика: {stats}")
 

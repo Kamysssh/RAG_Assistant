@@ -38,10 +38,24 @@ SEMANTIC_CACHE_THRESHOLD = float(os.getenv("SEMANTIC_CACHE_THRESHOLD", "0.88"))
 # Путь к SQLite относительно каталога assistant_api
 DEFAULT_CACHE_DB = "corporate_rag_cache.db"
 
-# Корневая папка локальной базы знаний (подпапки: hr, post_sales, sales).
-# В перспективе тот же контент можно синхронизировать из Google Docs — достаточно
-# выгрузить текст в эти папки и снова запустить reindex.py.
+# База знаний только из Google Docs (просмотр по ссылке). Ссылки по умолчанию —
+# переопределение через KNOWLEDGE_<ROLE>_GOOGLE_DOCS в .env (через запятую).
 KNOWLEDGE_ROOT = "knowledge"
+
+DEFAULT_KNOWLEDGE_GOOGLE_DOCS: dict[str, str] = {
+    "hr": (
+        "https://docs.google.com/document/d/"
+        "1-QuUodZjynLm689jobFFFvPTGzbaQ7_KkDgEKOT52GM/edit"
+    ),
+    "post_sales": (
+        "https://docs.google.com/document/d/"
+        "1fOSccxldi1GdKS6gv2SVpqd5fEZYAD3ZAoPsvO-oxps/edit"
+    ),
+    "sales": (
+        "https://docs.google.com/document/d/"
+        "1UUIgXWZYPWaZ-S8XwVQ-PrpvmgcqCdyiC04pJNWghMg/edit"
+    ),
+}
 
 
 def collection_name_for_role(role: str) -> str:
@@ -52,5 +66,5 @@ def collection_name_for_role(role: str) -> str:
 
 
 def knowledge_dir_for_role(role: str) -> str:
-    """Относительный путь к папке с .txt для роли."""
+    """Устаревший каталог knowledge/<роль> (может отсутствовать; данные только из Google Docs)."""
     return f"{KNOWLEDGE_ROOT}/{role}"

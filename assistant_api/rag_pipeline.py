@@ -21,6 +21,7 @@ from config import (
 )
 from embeddings import embed_text
 from openai_client import create_openai_client
+from google_docs_knowledge import get_extra_sources_for_role
 from prompts import build_system_prompt
 from vector_store import VectorStore
 
@@ -71,8 +72,22 @@ class RAGPipeline:
             )
 
         if chunk_count == 0 or force_reindex:
-            logger.info("Загрузка документов из %s", self._data_path)
-            self.vector_store.load_documents(self._data_path, force_reload=force_reindex)
+            extras = get_extra_sources_for_role(role)
+            if not extras:
+                raise RuntimeError(
+                    f"Нет ссылок на Google Docs для роли «{role}». Задайте в .env "
+                    f"KNOWLEDGE_{role.upper()}_GOOGLE_DOCS или проверьте config.DEFAULT_KNOWLEDGE_GOOGLE_DOCS."
+                )
+            logger.info(
+                "Индексация из Google Docs (%s док.); локальный каталог %s не обязателен",
+                len(extras),
+                self._data_path,
+            )
+            self.vector_store.load_documents(
+                self._data_path,
+                force_reload=force_reindex,
+                extra_sources=extras,
+            )
 
         def _embed_for_cache(q: str) -> list[float]:
             return embed_text(q, self.openai_client)

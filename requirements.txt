@@ -8,6 +8,7 @@ sentence-transformers>=2.2.0
 python-dotenv>=1.0.0
 pysbd>=0.3.4
 requests>=2.31.0
+certifi>=2024.0.0
 
 # Совместимые версии для Python 3.12 и RAGAS
 pydantic>=2.0.0,<3.0.0

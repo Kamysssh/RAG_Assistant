@@ -9,7 +9,7 @@ import re
 import shutil
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 import chromadb
 from dotenv import load_dotenv
@@ -290,13 +290,21 @@ class VectorStore:
         
         return chunks
     
-    def load_documents(self, file_path: str, force_reload: bool = False):
+    def load_documents(
+        self,
+        file_path: str,
+        force_reload: bool = False,
+        extra_sources: List[Tuple[str, str]] | None = None,
+    ):
         """
         Загрузка документов из файла в векторное хранилище.
         
         Args:
-            file_path: путь к файлу с документами
+            file_path: путь к файлу или каталогу с .txt
+            force_reload: пересоздать коллекцию и переиндексировать
+            extra_sources: дополнительные фрагменты (имя_источника, текст), напр. из Google Docs
         """
+        extra_sources = extra_sources or []
         # Проверка, не загружены ли уже документы
         if self.collection.count() > 0 and not force_reload:
             logger.info("Документы уже загружены в коллекцию")
@@ -311,14 +319,16 @@ class VectorStore:
         if not input_path.is_absolute():
             input_path = Path(__file__).resolve().parent / input_path
 
-        # Поддержка как одного файла, так и директории с *.txt
+        source_files: List[Path] = []
         if not input_path.exists():
-            raise FileNotFoundError(f"Путь {input_path} не найден")
-
-        if input_path.is_dir():
+            if not extra_sources:
+                raise FileNotFoundError(f"Путь {input_path} не найден")
+        elif input_path.is_dir():
             source_files = sorted(input_path.glob("*.txt"))
-            if not source_files:
-                raise FileNotFoundError(f"В директории {input_path} не найдено .txt файлов")
+            if not source_files and not extra_sources:
+                raise FileNotFoundError(
+                    f"В директории {input_path} не найдено .txt и нет внешних источников"
+                )
         else:
             source_files = [input_path]
 
@@ -328,6 +338,11 @@ class VectorStore:
             if not content:
                 continue
             merged_documents.append(f"Источник: {source_file.name}\n{content}")
+
+        for label, body in extra_sources:
+            body = (body or "").strip()
+            if body:
+                merged_documents.append(f"Источник: {label}\n{body}")
 
         if not merged_documents:
             raise ValueError(f"В источнике {input_path} нет текста для индексации")
@@ -420,18 +435,20 @@ if __name__ == "__main__":
     # Ручная проверка: из каталога assistant_api — python vector_store.py
     import sys
 
+    from google_docs_knowledge import get_extra_sources_for_role
+
     if not os.getenv("OPENAI_API_KEY"):
         print("Ошибка: установите переменную окружения OPENAI_API_KEY")
         sys.exit(1)
 
     _here = Path(__file__).resolve().parent
-    _knowledge_hr = _here / "knowledge" / "hr"
-    vector_store = VectorStore(collection_name="test_collection")
-    if _knowledge_hr.is_dir():
-        vector_store.load_documents(str(_knowledge_hr))
-    else:
-        print(f"Нет папки {_knowledge_hr} — положите .txt или передайте путь в коде.")
+    _hr_dir = _here / "knowledge" / "hr"
+    extras = get_extra_sources_for_role("hr")
+    if not extras:
+        print("Нет источников Google Docs для роли hr (config / .env).")
         sys.exit(1)
+    vector_store = VectorStore(collection_name="test_collection")
+    vector_store.load_documents(str(_hr_dir), force_reload=True, extra_sources=extras)
 
     results = vector_store.search(
         "Когда выплачивается премия за рекомендацию кандидата?", top_k=3

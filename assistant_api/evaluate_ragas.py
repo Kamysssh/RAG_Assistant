@@ -40,7 +40,7 @@ except ImportError:
 from rag_pipeline import RAGPipeline
 
 
-# Тестовые вопросы (база: assistant_api/knowledge/hr/, роль hr)
+# Тестовые вопросы (база: Google Docs для роли hr, см. config.DEFAULT_KNOWLEDGE_GOOGLE_DOCS)
 EVALUATION_QUESTIONS = [
     "За сколько дней нужно подать заявку на отпуск через HR-портал?",
     "Как часто проходит обязательное обучение по продукту?",
